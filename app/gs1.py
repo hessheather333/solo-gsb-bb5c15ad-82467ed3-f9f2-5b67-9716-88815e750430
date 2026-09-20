@@ -6,27 +6,53 @@ AI 310n (net weight, kilograms) and AI 320n (net weight, pounds),
 where ``n`` (0-9) is the number of implied decimal places and the
 field is a fixed 6-digit number.
 
+The supported vocabulary lives in one immutable, declarative registry
+(:data:`REGISTRY`). Every entry is either:
+
+* an :class:`ExactAIDecl` -- a concrete, fixed-length identifier (01, 10,
+  17, 21), or
+* a :class:`FamilyAIDecl` -- an identifier prefix (``310`` / ``320``)
+  together with exactly one *parameter* character ``n`` (a digit 0-9
+  selecting the implied decimal precision); the concrete identifiers are
+  ``3100``..``3109`` and ``3200``..``3209``.
+
+The registry is built and validated once at import time
+(:func:`build_registry`): declarations must carry complete lengths and
+character sets, a callable semantic validator, concrete identifiers must
+not collide, and no family prefix may shadow another prefix or an exact
+AI -- the concrete vocabulary is therefore unambiguous and longest-match
+resolution always has a unique answer.
+
 Two input forms are accepted by :func:`parse`:
 
 1. Raw GS1 element strings as emitted by scanners. Fixed-length fields
    (01, 17, 310n, 320n) are delimited implicitly by their length;
    variable-length fields (10, 21) must be terminated by the FNC1
    separator (ASCII 29, GS) unless they are the last field in the
-   string. Four-character AIs are recognised by longest match (the
-   310n/320n family takes precedence over any 2-character AI).
+   string. Identifiers are recognised by longest match (the
+   four-character 310n/320n family takes precedence over any
+   two-character AI); a weight-family prefix with a missing or
+   non-numeric parameter is reported as INVALID_PRECISION rather than
+   being mistaken for a shorter AI.
 
-2. GS1 Digital Link URIs (``http://`` / ``https://``).  AI/value pairs
+2. GS1 Digital Link URIs (``http://`` / ``https://``). AI/value pairs
    are read from the URI path (``/AI/value/AI/value``) first and then
-   from query parameters (``?AI=value&AI=value``).  Percent-encoded
-   bytes are decoded as UTF-8 before the same character-set, length,
-   check-digit and date validation is applied.
+   from query parameters (``?AI=value&AI=value``). The URI carrier
+   recognises its keys with the same registry recogniser
+   (:func:`recognize_key`) -- whole-key match with family-prefix
+   awareness -- and both carriers dispatch to the same value validation
+   (charset, length and per-AI semantic checks). Percent-encoded bytes
+   are decoded as UTF-8 before validation.
 """
 
 from __future__ import annotations
 
 import calendar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import Enum
+from types import MappingProxyType
+from typing import Callable, FrozenSet, Mapping, Optional, Tuple
 
 GS = "\x1d"  # ASCII 29 <GS>, transmitted as FNC1 by scanners
 
@@ -43,59 +69,16 @@ AI82 = frozenset(
     "!\"%&'()*+,-./:;<=>?_"
 )
 
+PARAMETER_DIGITS: Tuple[str, ...] = tuple("0123456789")
 
-@dataclass(frozen=True)
-class AISpec:
-    ai: str
-    name: str
-    min_length: int
-    max_length: int
-    fixed_length: bool
-    charset: frozenset
-    charset_rule: str
-    ai_length: int = 2  # number of AI characters (4 for the 310n/320n family)
-    decimals: int | None = None  # implied decimal places (310n/320n only)
-    unit: str | None = None  # measurement unit emitted alongside decimal_value
-
-
-# Variable-metric weight families: AI prefix -> (name, unit)
-WEIGHT_AI_FAMILIES = {
-    "310": ("NET WEIGHT (KG)", "kg"),
-    "320": ("NET WEIGHT (LB)", "lb"),
-}
-
-
-def _build_ai_specs() -> dict[str, AISpec]:
-    specs = {
-        "01": AISpec("01", "GTIN", 14, 14, True, DIGITS, "digits 0-9"),
-        "17": AISpec("17", "EXPIRY", 6, 6, True, DIGITS, "digits 0-9"),
-        "10": AISpec("10", "BATCH/LOT", 1, 20, False, AI82, "GS1 AI character set 82"),
-        "21": AISpec("21", "SERIAL", 1, 20, False, AI82, "GS1 AI character set 82"),
-    }
-    for prefix, (name, unit) in WEIGHT_AI_FAMILIES.items():
-        for n in range(10):
-            ai = f"{prefix}{n}"
-            specs[ai] = AISpec(
-                ai,
-                name,
-                6,
-                6,
-                True,
-                DIGITS,
-                "digits 0-9",
-                ai_length=4,
-                decimals=n,
-                unit=unit,
-            )
-    return specs
-
-
-AI_SPECS = _build_ai_specs()
 
 SUPPORTED_AIS = (
     "01, 10, 17, 21 and the weight family 310n/320n "
     "(n = 0-9 implied decimal places, fixed 6 digits)"
 )
+
+
+# ============================================================ error / elements
 
 
 class GS1ParseError(Exception):
@@ -127,13 +110,489 @@ class Element:
     name: str
     value: str
     offset: int  # byte offset of the AI within the input
-    decimal_value: float | None = None  # 310n/320n only: value with implied decimal point
-    unit: str | None = None  # 310n/320n only: "kg" or "lb"
+    decimal_value: Optional[float] = None  # 310n/320n only: value with implied decimal point
+    unit: Optional[str] = None  # 310n/320n only: "kg" or "lb"
 
 
 def _byte_offset(data: str, index: int) -> int:
     """Byte offset (UTF-8) of the character at ``index``."""
     return len(data[:index].encode("utf-8"))
+
+
+# ============================================================ semantic handlers
+
+
+SemanticHandler = Callable[[str, "AISpec", list], Optional["WeightSemantics"]]
+"""Validate a charset/length-checked value and describe its result.
+
+``offsets[i]`` is the raw byte offset of ``value[i]`` so semantic errors
+can be positioned precisely. The handler raises :class:`GS1ParseError` on
+failure and, for the weight family, returns :class:`WeightSemantics`
+carrying the measurement unit; it returns ``None`` for AIs without a
+decoded value.
+"""
+
+
+@dataclass(frozen=True)
+class WeightSemantics:
+    """Result-side description of a decoded 310n/320n weight value."""
+
+    unit: str
+
+
+def _check_gtin(gtin, offsets):
+    total = 0
+    for i, ch in enumerate(reversed(gtin[:-1])):
+        total += int(ch) * (3 if i % 2 == 0 else 1)
+    expected = (10 - total % 10) % 10
+    if expected != int(gtin[-1]):
+        raise GS1ParseError(
+            "INVALID_CHECK_DIGIT",
+            f"GTIN check digit mismatch: expected {expected}, found {gtin[-1]}",
+            offset=offsets[-1],
+            expected=f"Mod-10 check digit {expected}",
+            found=gtin[-1],
+        )
+
+
+def _check_date(yymmdd, offsets):
+    yy = int(yymmdd[0:2])
+    mm = int(yymmdd[2:4])
+    dd = int(yymmdd[4:6])
+    year = 2000 + yy
+    if not 1 <= mm <= 12:
+        raise GS1ParseError(
+            "INVALID_DATE",
+            f"Invalid expiry month {mm:02d} in AI 17 date '{yymmdd}'",
+            offset=offsets[2],
+            expected="month 01-12",
+            found=yymmdd[2:4],
+        )
+    last_day = calendar.monthrange(year, mm)[1]
+    if dd == 0:
+        return  # GS1: day "00" denotes the last day of the month
+    if dd > last_day:
+        raise GS1ParseError(
+            "INVALID_DATE",
+            f"Invalid expiry day {dd:02d} for {year}-{mm:02d} (max {last_day})",
+            offset=offsets[4],
+            expected=f"day 01-{last_day} for {year}-{mm:02d} (00 = last day of month)",
+            found=yymmdd[4:6],
+        )
+
+
+def decode_weight(value: str, decimals: int) -> Decimal:
+    """Interpret the 6 fixed digits with ``decimals`` implied places exactly.
+
+    The GS1 variable-metric rule is ``int(digits) / 10**n``; when n > 6
+    the missing high-order fractional digits are implied zero, e.g.
+    ``3109 000001`` -> Decimal('0.000000001').  The result is built from
+    the integer digits and a power of ten, so no binary float is ever
+    involved.
+    """
+    return Decimal(int(value)).scaleb(-decimals)
+
+
+def _noop_semantics(value: str, spec: "AISpec", offsets: list) -> None:
+    """Default semantic handler: charset/length checks are sufficient."""
+    return None
+
+
+def _gtin_semantics(value: str, spec: "AISpec", offsets: list) -> None:
+    _check_gtin(value, offsets)
+    return None
+
+
+def _date_semantics(value: str, spec: "AISpec", offsets: list) -> None:
+    _check_date(value, offsets)
+    return None
+
+
+def _weight_semantics(fam: "FamilyAIDecl", parameter: int) -> SemanticHandler:
+    """Build the semantic handler of one 310n/320n concrete AI."""
+
+    unit = fam.unit
+
+    def handler(value: str, spec: "AISpec", offsets: list) -> WeightSemantics:
+        # The value is already known to be six digits; the exact Decimal
+        # decoding happens on demand via decode_weight(); the handler only
+        # attaches the unit carried by every weight element.
+        return WeightSemantics(unit=unit)
+
+    return handler
+
+
+# ============================================================ the registry
+
+
+@dataclass(frozen=True)
+class ValueField:
+    """Declarative shape of an AI's data field."""
+
+    min_length: int
+    max_length: int
+    fixed_length: bool
+    charset: FrozenSet[str]
+    charset_rule: str
+
+
+@dataclass(frozen=True)
+class ExactAIDecl:
+    """An AI with a concrete, literal identifier (e.g. ``"01"``)."""
+
+    ai: str
+    name: str
+    field: ValueField
+    semantics: SemanticHandler = _noop_semantics
+
+
+@dataclass(frozen=True)
+class FamilyAIDecl:
+    """An identifier family: a prefix plus one parameter character.
+
+    Concrete identifiers are ``prefix + parameter`` for every parameter in
+    :data:`PARAMETER_DIGITS` (``310`` + ``0``..``9`` -> ``3100``..``3109``);
+    the parameter value is the number of implied decimal places and is
+    exposed on each resolved spec as ``decimals``.
+    """
+
+    prefix: str
+    name: str
+    field: ValueField
+    semantics_factory: Callable[["FamilyAIDecl", int], SemanticHandler] = _weight_semantics
+    unit: Optional[str] = None  # measurement unit emitted with the element
+
+    @property
+    def identifier_length(self) -> int:
+        return len(self.prefix) + 1
+
+    def expected_pattern(self) -> str:
+        """Human-readable concrete form, e.g. ``"310n"``."""
+        return f"{self.prefix}n"
+
+
+@dataclass(frozen=True)
+class AISpec:
+    """Resolved, immutable view of one concrete identifier used by the parser."""
+
+    ai: str
+    name: str
+    min_length: int
+    max_length: int
+    fixed_length: bool
+    charset: FrozenSet[str]
+    charset_rule: str
+    ai_length: int
+    semantics: SemanticHandler = _noop_semantics
+    decimals: Optional[int] = None  # implied decimal places (310n/320n only)
+    unit: Optional[str] = None  # measurement unit emitted alongside decimal_value
+    family: Optional[FamilyAIDecl] = None  # set for 310n/320n members
+
+
+class RegistryDefinitionError(Exception):
+    """The declarative AI table is malformed (raised once, at import time)."""
+
+
+# Declarations, in canonical (first-seen) order. The table is the single
+# source of truth: adding an AI means adding one row here -- nothing in the
+# recogniser or in either parser is hard-coded to a particular AI.
+_EXACT_DECLARATIONS: Tuple[ExactAIDecl, ...] = (
+    ExactAIDecl(
+        ai="01",
+        name="GTIN",
+        field=ValueField(14, 14, True, DIGITS, "digits 0-9"),
+        semantics=_gtin_semantics,
+    ),
+    ExactAIDecl(
+        ai="17",
+        name="EXPIRY",
+        field=ValueField(6, 6, True, DIGITS, "digits 0-9"),
+        semantics=_date_semantics,
+    ),
+    ExactAIDecl(
+        ai="10",
+        name="BATCH/LOT",
+        field=ValueField(1, 20, False, AI82, "GS1 AI character set 82"),
+    ),
+    ExactAIDecl(
+        ai="21",
+        name="SERIAL",
+        field=ValueField(1, 20, False, AI82, "GS1 AI character set 82"),
+    ),
+)
+
+_FAMILY_DECLARATIONS: Tuple[FamilyAIDecl, ...] = (
+    FamilyAIDecl(
+        prefix="310",
+        name="NET WEIGHT (KG)",
+        field=ValueField(6, 6, True, DIGITS, "digits 0-9"),
+        semantics_factory=_weight_semantics,
+        unit="kg",
+    ),
+    FamilyAIDecl(
+        prefix="320",
+        name="NET WEIGHT (LB)",
+        field=ValueField(6, 6, True, DIGITS, "digits 0-9"),
+        semantics_factory=_weight_semantics,
+        unit="lb",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class AIRegistry:
+    """Immutable, validated registry of exact and parameterised family AIs."""
+
+    specs: Mapping[str, AISpec] = field(default_factory=dict)
+    exact: Mapping[str, ExactAIDecl] = field(default_factory=dict)
+    families: Mapping[str, FamilyAIDecl] = field(default_factory=dict)
+    exact_order: Tuple[str, ...] = ()
+    family_order: Tuple[str, ...] = ()
+
+    def resolve(self, ai: str) -> Optional[AISpec]:
+        """Resolve a complete concrete identifier (longest, unambiguous)."""
+        return self.specs.get(ai)
+
+    def family_at(self, prefix: str) -> Optional[FamilyAIDecl]:
+        return self.families.get(prefix)
+
+    @property
+    def min_identifier_length(self) -> int:
+        lengths = [len(ai) for ai in self.exact]
+        lengths.extend(len(prefix) + 1 for prefix in self.families)
+        return min(lengths, default=0)
+
+    def family_prefixes_longest_first(self) -> Tuple[str, ...]:
+        return tuple(
+            sorted(self.family_order, key=lambda p: (-len(p), self.family_order.index(p)))
+        )
+
+
+def _validate_value_field(owner: str, fld: ValueField) -> None:
+    if not isinstance(fld, ValueField):
+        raise RegistryDefinitionError(f"{owner}: field must be a ValueField")
+    if (
+        not isinstance(fld.min_length, int)
+        or not isinstance(fld.max_length, int)
+        or fld.min_length <= 0
+        or fld.max_length < fld.min_length
+    ):
+        raise RegistryDefinitionError(f"{owner}: invalid length bounds")
+    if fld.fixed_length and fld.min_length != fld.max_length:
+        raise RegistryDefinitionError(
+            f"{owner}: fixed_length field must have min_length == max_length"
+        )
+    if not isinstance(fld.charset, frozenset) or not fld.charset:
+        raise RegistryDefinitionError(f"{owner}: charset must be a non-empty frozenset")
+    if not isinstance(fld.charset_rule, str) or not fld.charset_rule:
+        raise RegistryDefinitionError(f"{owner}: charset_rule must be a non-empty string")
+
+
+def build_registry(
+    exact_declarations: Tuple[ExactAIDecl, ...] = _EXACT_DECLARATIONS,
+    family_declarations: Tuple[FamilyAIDecl, ...] = _FAMILY_DECLARATIONS,
+) -> AIRegistry:
+    """Build and validate the immutable registry from declarative rows.
+
+    Validates, once at startup:
+
+    * each row has a well-formed all-digit identifier/prefix, a complete
+      length and character-set description and a callable semantic handler;
+    * exact identifiers and family prefixes are unique and all digits;
+    * no family prefix shadows (equals or is a prefix of) another family
+      prefix, and no exact identifier collides with a family prefix -- the
+      vocabulary is therefore unambiguous under longest-match resolution;
+    * the expanded concrete identifiers (family prefix + every parameter
+      digit) are all distinct and complete.
+    """
+    exact: dict[str, ExactAIDecl] = {}
+    families: dict[str, FamilyAIDecl] = {}
+    exact_order: list[str] = []
+    family_order: list[str] = []
+    specs: dict[str, AISpec] = {}
+
+    for decl in exact_declarations:
+        if not isinstance(decl, ExactAIDecl):
+            raise RegistryDefinitionError(f"{decl!r}: not an ExactAIDecl")
+        owner = f"exact AI {decl.ai!r}"
+        if not decl.ai or not all(c in DIGITS for c in decl.ai):
+            raise RegistryDefinitionError(f"{owner}: identifier must be non-empty digits")
+        if not isinstance(decl.name, str) or not decl.name:
+            raise RegistryDefinitionError(f"{owner}: name is required")
+        _validate_value_field(owner, decl.field)
+        if not callable(decl.semantics):
+            raise RegistryDefinitionError(f"{owner}: semantic handler must be callable")
+        if decl.ai in exact:
+            raise RegistryDefinitionError(f"duplicate exact AI declaration: {decl.ai!r}")
+        exact[decl.ai] = decl
+        exact_order.append(decl.ai)
+        specs[decl.ai] = AISpec(
+            ai=decl.ai,
+            name=decl.name,
+            min_length=decl.field.min_length,
+            max_length=decl.field.max_length,
+            fixed_length=decl.field.fixed_length,
+            charset=decl.field.charset,
+            charset_rule=decl.field.charset_rule,
+            ai_length=len(decl.ai),
+            semantics=decl.semantics,
+        )
+
+    for fam in family_declarations:
+        if not isinstance(fam, FamilyAIDecl):
+            raise RegistryDefinitionError(f"{fam!r}: not a FamilyAIDecl")
+        owner = f"family AI {fam.prefix!r}"
+        if not fam.prefix or not all(c in DIGITS for c in fam.prefix):
+            raise RegistryDefinitionError(f"{owner}: prefix must be non-empty digits")
+        if not isinstance(fam.name, str) or not fam.name:
+            raise RegistryDefinitionError(f"{owner}: name is required")
+        _validate_value_field(owner, fam.field)
+        if not callable(fam.semantics_factory):
+            raise RegistryDefinitionError(f"{owner}: semantics_factory must be callable")
+        if fam.prefix in families:
+            raise RegistryDefinitionError(
+                f"duplicate family AI prefix declaration: {fam.prefix!r}"
+            )
+        families[fam.prefix] = fam
+        family_order.append(fam.prefix)
+
+    # Cross-declaration ambiguity checks. A concrete identifier must have a
+    # unique producer, and longest-match resolution must never need to break
+    # a tie between a family and another prefix or an exact AI.
+    for prefix, fam in families.items():
+        if prefix in exact:
+            raise RegistryDefinitionError(
+                f"family prefix {prefix!r} collides with exact AI {prefix!r}"
+            )
+        for other in families:
+            if other != prefix and (
+                other.startswith(prefix) or prefix.startswith(other)
+            ):
+                raise RegistryDefinitionError(
+                    f"family prefixes {prefix!r} and {other!r} shadow each other; "
+                    "the identifier vocabulary would be ambiguous"
+                )
+        for n, parameter in enumerate(PARAMETER_DIGITS):
+            ai = f"{prefix}{parameter}"
+            if ai in specs:
+                raise RegistryDefinitionError(
+                    f"concrete AI {ai!r} produced by family {prefix!r} is already "
+                    "declared elsewhere"
+                )
+            try:
+                semantics = fam.semantics_factory(fam, n)
+            except Exception as exc:  # a broken table must fail at startup
+                raise RegistryDefinitionError(
+                    f"family {prefix!r}: semantics factory failed for parameter {parameter!r}"
+                ) from exc
+            if not callable(semantics):
+                raise RegistryDefinitionError(
+                    f"family {prefix!r}: semantics for parameter {parameter!r} is not callable"
+                )
+            specs[ai] = AISpec(
+                ai=ai,
+                name=fam.name,
+                min_length=fam.field.min_length,
+                max_length=fam.field.max_length,
+                fixed_length=fam.field.fixed_length,
+                charset=fam.field.charset,
+                charset_rule=fam.field.charset_rule,
+                ai_length=fam.identifier_length,
+                semantics=semantics,
+                decimals=n,
+                unit=fam.unit,
+                family=fam,
+            )
+
+    return AIRegistry(
+        specs=MappingProxyType(specs),
+        exact=MappingProxyType(exact),
+        families=MappingProxyType(families),
+        exact_order=tuple(exact_order),
+        family_order=tuple(family_order),
+    )
+
+
+REGISTRY: AIRegistry = build_registry()
+
+# Backwards-compatible introspection aliases (read-only views).
+AI_SPECS: Mapping[str, AISpec] = REGISTRY.specs
+WEIGHT_AI_FAMILIES: Mapping[str, tuple] = MappingProxyType(
+    {
+        prefix: (fam.name, fam.unit)
+        for prefix, fam in REGISTRY.families.items()
+    }
+)
+
+
+# ============================================================ the recogniser
+
+
+class AIKeyStatus(Enum):
+    """Outcome of recognising a complete identifier key."""
+
+    MATCHED = "matched"
+    INVALID_KEY = "invalid_key"  # not a numeric identifier
+    MISSING_PARAMETER = "missing_parameter"  # family prefix without its parameter
+    BAD_PARAMETER = "bad_parameter"  # family parameter outside 0-9
+    UNSUPPORTED = "unsupported"  # well-formed numeric identifier, not in the registry
+
+
+@dataclass(frozen=True)
+class AIKeyRecognition:
+    status: AIKeyStatus
+    spec: Optional[AISpec] = None
+    family: Optional[FamilyAIDecl] = None
+    parameter: Optional[str] = None  # offending parameter when BAD_PARAMETER
+
+
+def recognize_key(key: str) -> AIKeyRecognition:
+    """Recognise a *complete* identifier token against the registry.
+
+    Shared by both carriers: Digital Link keys are whole path segments /
+    query keys, and the element-string parser feeds the candidate token it
+    has read. Recognition is registry-driven:
+
+    1. a family prefix without its parameter -> MISSING_PARAMETER;
+    2. a family prefix whose parameter is not a digit -> BAD_PARAMETER;
+    3. the longest concrete identifier present in the registry -> MATCHED;
+    4. any other non-empty all-digit token -> UNSUPPORTED;
+    5. an empty / non-numeric token -> INVALID_KEY.
+
+    The family rules (1-2) are deliberately evaluated *before* the generic
+    all-digit rule: "310" and "310x" are precision errors, never an
+    unsupported identifier or a mistaken shorter AI.
+    """
+    # Family-prefix rules first: "310" (parameter missing) and "310x"
+    # (parameter not a digit) are precision errors even though the token is
+    # not fully numeric or fully present.
+    for prefix in REGISTRY.family_prefixes_longest_first():
+        if key.startswith(prefix):
+            family = REGISTRY.family_at(prefix)
+            if len(key) == len(prefix):
+                return AIKeyRecognition(
+                    status=AIKeyStatus.MISSING_PARAMETER, family=family
+                )
+            parameter = key[len(prefix)]
+            if parameter not in DIGITS:
+                return AIKeyRecognition(
+                    status=AIKeyStatus.BAD_PARAMETER,
+                    family=family,
+                    parameter=parameter,
+                )
+            break
+
+    if not key or not all(c in DIGITS for c in key):
+        return AIKeyRecognition(status=AIKeyStatus.INVALID_KEY)
+
+    # Longest concrete identifier wins (310n/320n over any shorter AI).
+    spec = REGISTRY.resolve(key)
+    if spec is not None:
+        return AIKeyRecognition(status=AIKeyStatus.MATCHED, spec=spec)
+    return AIKeyRecognition(status=AIKeyStatus.UNSUPPORTED)
+
+
+# ============================================================ entry point
 
 
 def parse(data: str) -> list[Element]:
@@ -176,8 +635,7 @@ def _parse_element_string(data: str) -> list[Element]:
 
         # UTF-8 byte offset of every value character in the raw input
         offsets = [_byte_offset(data, value_pos + i) for i in range(len(value))]
-        _check_charset(spec, value, offsets)
-        decimal_value, unit = _apply_semantics(spec, value, offsets)
+        decimal_value, unit = _validate_value(spec, value, offsets)
 
         elements.append(
             Element(
@@ -198,11 +656,12 @@ def _match_element_string_ai(data: str, pos: int, ai_offset: int):
     Returns ``(spec, new_pos)`` or raises :class:`GS1ParseError`. The
     four-character 310n/320n identifiers take precedence over the
     two-character set; a malformed family prefix (missing or non-digit
-    precision digit) is reported as INVALID_PRECISION rather than being
+    parameter) is reported as INVALID_PRECISION rather than being
     mistaken for a 2-character AI.
     """
-    head = data[pos : pos + 2]
-    if len(head) < 2 or not all(c in DIGITS for c in head):
+    min_len = REGISTRY.min_identifier_length
+    head = data[pos : pos + min_len]
+    if len(head) < min_len or not all(c in DIGITS for c in head):
         raise GS1ParseError(
             "INVALID_AI",
             f"Expected a numeric application identifier, found {head!r}",
@@ -211,53 +670,75 @@ def _match_element_string_ai(data: str, pos: int, ai_offset: int):
             found=head,
         )
 
-    family = data[pos : pos + 3]
-    if family in WEIGHT_AI_FAMILIES:
-        if pos + 3 >= len(data):
+    # The scanner stream has no delimiter in front of the AI, so first detect
+    # a family prefix whose parameter is physically absent (end of input) or
+    # replaced by the FNC1 separator -- those cases carry stream-specific
+    # messages the whole-key recogniser cannot produce.
+    family_prefix = None
+    for prefix in REGISTRY.family_prefixes_longest_first():
+        if data.startswith(prefix, pos):
+            family_prefix = prefix
+            break
+    if family_prefix is not None:
+        fam = REGISTRY.family_at(family_prefix)
+        parameter_pos = pos + len(family_prefix)
+        if parameter_pos >= len(data):
             raise GS1ParseError(
                 "INVALID_PRECISION",
-                f"AI family {family} requires a precision digit (0-9) but the input ended",
+                f"AI family {family_prefix} requires a precision digit (0-9) but the input ended",
                 offset=_byte_offset(data, len(data)),
-                expected=f"precision digit 0-9 for AI {family}n",
+                expected=f"precision digit 0-9 for AI {fam.expected_pattern()}",
                 found="end of input",
             )
-        precision = data[pos + 3]
-        if precision == GS:
+        if data[parameter_pos] == GS:
             raise GS1ParseError(
                 "INVALID_PRECISION",
-                f"AI family {family} requires a precision digit (0-9) but a "
+                f"AI family {family_prefix} requires a precision digit (0-9) but a "
                 "separator (ASCII 29) was found",
-                offset=_byte_offset(data, pos + 3),
-                expected=f"precision digit 0-9 for AI {family}n",
+                offset=_byte_offset(data, parameter_pos),
+                expected=f"precision digit 0-9 for AI {fam.expected_pattern()}",
                 found="<GS>",
             )
-        if precision not in DIGITS:
-            raise GS1ParseError(
-                "INVALID_PRECISION",
-                f"AI family {family} requires a precision digit 0-9 as its 4th "
-                f"character, found {precision!r}",
-                offset=_byte_offset(data, pos + 3),
-                expected=f"precision digit 0-9 for AI {family}n",
-                found=precision,
-            )
 
-    # Longest match first: the complete 4-character weight AI, otherwise
-    # the 2-character set.
-    four = data[pos : pos + 4]
-    spec = AI_SPECS.get(four) if len(four) == 4 else None
-    if spec is None:
-        ai = data[pos : pos + 2]
-        spec = AI_SPECS.get(ai)
-        if spec is None:
-            raise GS1ParseError(
-                "UNSUPPORTED_AI",
-                f"Unsupported application identifier '{ai}'",
-                offset=ai_offset,
-                expected=f"one of: {SUPPORTED_AIS}",
-                found=ai,
-            )
-        return spec, pos + 2
-    return spec, pos + spec.ai_length
+    # Build the longest candidate window -- concrete identifier lengths when
+    # the stream begins with one, otherwise the prefix-plus-parameter window
+    # (so "310A" reaches the recogniser intact instead of being truncated to
+    # the 2-character "31") -- and classify it with the shared recogniser.
+    longest = min_len
+    for concrete in REGISTRY.specs.values():
+        if data.startswith(concrete.ai, pos):
+            longest = max(longest, concrete.ai_length)
+    if family_prefix is not None:
+        longest = max(longest, len(family_prefix) + 1)
+    recognition = recognize_key(data[pos : pos + longest])
+
+    if recognition.status is AIKeyStatus.MATCHED:
+        spec = recognition.spec
+        return spec, pos + spec.ai_length
+    if recognition.status is AIKeyStatus.BAD_PARAMETER:
+        fam = recognition.family
+        parameter = recognition.parameter
+        parameter_pos = pos + len(fam.prefix)
+        raise GS1ParseError(
+            "INVALID_PRECISION",
+            f"AI family {fam.prefix} requires a precision digit 0-9 as its 4th "
+            f"character, found {parameter!r}",
+            offset=_byte_offset(data, parameter_pos),
+            expected=f"precision digit 0-9 for AI {fam.expected_pattern()}",
+            found=parameter,
+        )
+    # INVALID_KEY is already excluded by the head check; MISSING_PARAMETER is
+    # handled by the stream-specific branches above. Anything remaining is a
+    # well-formed numeric identifier the registry does not know, reported on
+    # the shortest declared identifier window (the historical 2-char AI).
+    ai = data[pos : pos + min_len]
+    raise GS1ParseError(
+        "UNSUPPORTED_AI",
+        f"Unsupported application identifier '{ai}'",
+        offset=ai_offset,
+        expected=f"one of: {SUPPORTED_AIS}",
+        found=ai,
+    )
 
 
 def _read_fixed(data, pos, spec):
@@ -325,77 +806,21 @@ def _check_charset(spec, field, offsets):
             )
 
 
-def _check_gtin(gtin, offsets):
-    total = 0
-    for i, ch in enumerate(reversed(gtin[:-1])):
-        total += int(ch) * (3 if i % 2 == 0 else 1)
-    expected = (10 - total % 10) % 10
-    if expected != int(gtin[-1]):
-        raise GS1ParseError(
-            "INVALID_CHECK_DIGIT",
-            f"GTIN check digit mismatch: expected {expected}, found {gtin[-1]}",
-            offset=offsets[-1],
-            expected=f"Mod-10 check digit {expected}",
-            found=gtin[-1],
-        )
+def _validate_value(spec: AISpec, value: str, offsets):
+    """Run the charset and per-AI semantic checks shared by both carriers.
 
+    Length checks are carrier-specific (a scanner stream ends a fixed field
+    at its length or at a separator, while a URI segment ends at the next
+    slash / ampersand) and are performed before calling this function.
 
-def _check_date(yymmdd, offsets):
-    yy = int(yymmdd[0:2])
-    mm = int(yymmdd[2:4])
-    dd = int(yymmdd[4:6])
-    year = 2000 + yy
-    if not 1 <= mm <= 12:
-        raise GS1ParseError(
-            "INVALID_DATE",
-            f"Invalid expiry month {mm:02d} in AI 17 date '{yymmdd}'",
-            offset=offsets[2],
-            expected="month 01-12",
-            found=yymmdd[2:4],
-        )
-    last_day = calendar.monthrange(year, mm)[1]
-    if dd == 0:
-        return  # GS1: day "00" denotes the last day of the month
-    if dd > last_day:
-        raise GS1ParseError(
-            "INVALID_DATE",
-            f"Invalid expiry day {dd:02d} for {year}-{mm:02d} (max {last_day})",
-            offset=offsets[4],
-            expected=f"day 01-{last_day} for {year}-{mm:02d} (00 = last day of month)",
-            found=yymmdd[4:6],
-        )
-
-
-def _apply_semantics(spec: AISpec, value: str, offsets):
-    """Run AI-specific validation after charset/length checks.
-
-    Returns ``(decimal_value, unit)``, both ``None`` unless the AI
-    belongs to the 310n/320n weight family.
+    Returns ``(decimal_value, unit)``, both ``None`` unless the AI belongs
+    to the 310n/320n weight family.
     """
-    if spec.ai == "01":
-        _check_gtin(value, offsets)
-    elif spec.ai == "17":
-        _check_date(value, offsets)
-    elif spec.decimals is not None:
-        return _decode_weight(value, spec), spec.unit
+    _check_charset(spec, value, offsets)
+    result = spec.semantics(value, spec, offsets)
+    if isinstance(result, WeightSemantics):
+        return float(decode_weight(value, spec.decimals)), result.unit
     return None, None
-
-
-def decode_weight(value: str, decimals: int) -> Decimal:
-    """Interpret the 6 fixed digits with ``decimals`` implied places exactly.
-
-    The GS1 variable-metric rule is ``int(digits) / 10**n``; when n > 6
-    the missing high-order fractional digits are implied zero, e.g.
-    ``3109 000001`` -> Decimal('0.000000001').  The result is built from
-    the integer digits and a power of ten, so no binary float is ever
-    involved.
-    """
-    return Decimal(int(value)).scaleb(-decimals)
-
-
-def _decode_weight(value: str, spec: AISpec) -> float:
-    """Float view of :func:`decode_weight` for the ``decimal_value`` field."""
-    return float(decode_weight(value, spec.decimals))
 
 
 # ------------------------------------------------------------ Digital Link URIs
@@ -458,7 +883,8 @@ def _parse_digital_link(data: str) -> list[Element]:
         ai_byte = ai_offsets[0] if ai_offsets else _byte_offset(data, ai_start)
 
         # In a URI the AI is the whole path segment / query key, so unlike
-        # element strings there is no fixed 2-character window to read.
+        # element strings there is no fixed 2-character window to read; the
+        # shared registry recogniser classifies the complete key.
         if not ai:
             raw_ai = data[ai_start:ai_end]
             raise GS1ParseError(
@@ -470,31 +896,29 @@ def _parse_digital_link(data: str) -> list[Element]:
                 found=raw_ai,
             )
 
-        # A 310n/320n family prefix with a missing or non-digit precision
-        # digit is reported as INVALID_PRECISION; this must be checked
-        # before the generic all-digits rule and the longest-match lookup.
-        family = ai[:3]
-        if family in WEIGHT_AI_FAMILIES:
-            if len(ai) < 4:
-                raise GS1ParseError(
-                    "INVALID_PRECISION",
-                    f"AI family {family} requires a precision digit (0-9) as "
-                    f"its 4th character in the {location}",
-                    offset=_byte_offset(data, ai_end),
-                    expected=f"4-character AI {family}n (precision digit 0-9)",
-                    found=ai,
-                )
-            if ai[3] not in DIGITS:
-                raise GS1ParseError(
-                    "INVALID_PRECISION",
-                    f"AI family {family} requires a precision digit 0-9 as its "
-                    f"4th character, found {ai[3]!r}",
-                    offset=ai_offsets[3],
-                    expected=f"precision digit 0-9 for AI {family}n",
-                    found=ai[3],
-                )
-
-        if not all(c in DIGITS for c in ai):
+        recognition = recognize_key(ai)
+        if recognition.status is AIKeyStatus.MISSING_PARAMETER:
+            fam = recognition.family
+            raise GS1ParseError(
+                "INVALID_PRECISION",
+                f"AI family {fam.prefix} requires a precision digit (0-9) as "
+                f"its 4th character in the {location}",
+                offset=_byte_offset(data, ai_end),
+                expected=f"4-character AI {fam.expected_pattern()} (precision digit 0-9)",
+                found=ai,
+            )
+        if recognition.status is AIKeyStatus.BAD_PARAMETER:
+            fam = recognition.family
+            parameter = recognition.parameter
+            raise GS1ParseError(
+                "INVALID_PRECISION",
+                f"AI family {fam.prefix} requires a precision digit 0-9 as its "
+                f"4th character, found {parameter!r}",
+                offset=ai_offsets[len(fam.prefix)],
+                expected=f"precision digit 0-9 for AI {fam.expected_pattern()}",
+                found=parameter,
+            )
+        if recognition.status is AIKeyStatus.INVALID_KEY:
             raw_ai = data[ai_start:ai_end]
             raise GS1ParseError(
                 "INVALID_AI",
@@ -504,8 +928,7 @@ def _parse_digital_link(data: str) -> list[Element]:
                 expected=f"numeric AI, one of: {SUPPORTED_AIS}",
                 found=raw_ai,
             )
-        spec = AI_SPECS.get(ai)
-        if spec is None:
+        if recognition.status is AIKeyStatus.UNSUPPORTED:
             raise GS1ParseError(
                 "UNSUPPORTED_AI",
                 f"Unsupported application identifier '{ai}' in the {location}",
@@ -513,6 +936,7 @@ def _parse_digital_link(data: str) -> list[Element]:
                 expected=f"one of: {SUPPORTED_AIS}",
                 found=ai,
             )
+        spec = recognition.spec
         if ai in seen:
             first_offset, first_location = seen[ai]
             if first_location == location:
@@ -655,7 +1079,7 @@ def _percent_decode(data: str, start: int, end: int) -> tuple[str, list[int]]:
 
 
 def _validate_uri_value(spec, value, offsets, end_offset):
-    """Length, charset and semantic checks for a percent-decoded URI value.
+    """Length checks for a percent-decoded URI value, then shared validation.
 
     Returns ``(decimal_value, unit)`` (both ``None`` outside the 310n/320n
     weight family).
@@ -698,5 +1122,4 @@ def _validate_uri_value(spec, value, offsets, end_offset):
                 found=f"{len(value)} characters",
             )
 
-    _check_charset(spec, value, offsets)
-    return _apply_semantics(spec, value, offsets)
+    return _validate_value(spec, value, offsets)

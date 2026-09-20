@@ -1,5 +1,6 @@
 """End-to-end tests for the /parse endpoint."""
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -733,3 +734,167 @@ def test_digital_link_weight_percent_encoded_bad_precision_offset():
     assert detail["error"] == "INVALID_PRECISION"
     assert detail["found"] == "A"
     assert detail["offset"] == 22
+
+
+# ------------------------- registry-driven recogniser: extra coverage ------
+
+
+def test_registry_resolves_all_weight_family_members():
+    from app.gs1 import REGISTRY
+
+    for prefix, unit in (("310", "kg"), ("320", "lb")):
+        for n in range(10):
+            spec = REGISTRY.resolve(f"{prefix}{n}")
+            assert spec is not None
+            assert spec.ai_length == 4
+            assert spec.decimals == n
+            assert spec.unit == unit
+            assert spec.fixed_length is True
+            assert spec.max_length == 6
+
+
+def test_weight_family_320_missing_precision_before_separator():
+    resp = parse(f"310{GS}17250131")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 3
+    assert detail["found"] == "<GS>"
+
+
+def test_weight_family_non_digit_precision_offset_320():
+    resp = parse("320x002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 3
+    assert detail["found"] == "x"
+
+
+def test_digital_link_weight_missing_precision_path_320():
+    resp = parse(f"{DL_BASE}/320/002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["found"] == "320"
+    assert detail["offset"] == 22
+
+
+def test_digital_link_weight_bad_parameter_in_query():
+    resp = parse(f"{DL_BASE}?310A=002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["found"] == "A"
+    assert "310" in detail["message"]
+
+
+def test_unknown_ai_single_character_element_string():
+    resp = parse("9")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_AI"
+    assert detail["offset"] == 0
+    assert detail["found"] == "9"
+
+
+def test_unknown_ai_letter_prefix_element_string():
+    resp = parse("A1BC")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_AI"
+    assert detail["found"] == "A1"
+
+
+def test_digital_link_unknown_four_digit_ai_path():
+    resp = parse(f"{DL_BASE}/9999/x")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNSUPPORTED_AI"
+    assert detail["found"] == "9999"
+    assert detail["offset"] == 19
+
+
+def test_digital_link_unknown_five_digit_ai_query():
+    resp = parse(f"{DL_BASE}?31031=x")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNSUPPORTED_AI"
+    assert detail["found"] == "31031"
+
+
+def test_digital_link_non_numeric_fourth_character_is_precision_error():
+    # "310-" starts with the family prefix but its parameter is not a digit;
+    # it must be INVALID_PRECISION rather than INVALID_AI/UNSUPPORTED_AI.
+    resp = parse(f"{DL_BASE}/310-/002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["found"] == "-"
+    assert detail["offset"] == 22
+
+
+# ------------------------- dual-carrier consistency over HTTP --------------
+
+
+def test_two_carriers_return_identical_elements():
+    es = parse(
+        f"01{GTIN_OK}17250131310300251310ABC123{GS}21SN0001"
+    ).json()["elements"]
+    dl = parse(
+        f"{DL_BASE}/01/{GTIN_OK}/17/250131/3103/002513?10=ABC123&21=SN0001"
+    ).json()["elements"]
+
+    def projected(elements):
+        # unit/decimal_value are absent (not null) for non-weight elements
+        return [
+            [
+                e["ai"],
+                e["name"],
+                e["value"],
+                e.get("unit"),
+                e.get("decimal_value"),
+            ]
+            for e in elements
+        ]
+
+    # order, names and values match; only the AI offsets are carrier-specific
+    assert projected(es) == projected(dl)
+
+
+@pytest.mark.parametrize(
+    "element_string,digital_link,error_code",
+    [
+        ("0109501101530004", f"{DL_BASE}/01/09501101530004", "INVALID_CHECK_DIGIT"),
+        ("17250230", f"{DL_BASE}/17/250230", "INVALID_DATE"),
+        ("310300251", f"{DL_BASE}/3103/00251", "FIELD_TOO_SHORT"),
+        ("310", f"{DL_BASE}/310/002513", "INVALID_PRECISION"),
+        ("310A002513", f"{DL_BASE}/310A/002513", "INVALID_PRECISION"),
+        ("99ABC", f"{DL_BASE}/99/abc", "UNSUPPORTED_AI"),
+        ("3110000000", f"{DL_BASE}/3110/000000", "UNSUPPORTED_AI"),
+    ],
+)
+def test_two_carriers_share_error_codes(element_string, digital_link, error_code):
+    es = parse(element_string)
+    dl = parse(digital_link)
+    assert es.status_code == dl.status_code == 422
+    assert es.json()["detail"]["error"] == error_code
+    assert dl.json()["detail"]["error"] == error_code
+
+
+def test_two_carriers_share_variable_field_too_long():
+    # Fixed-length scanner fields self-delimit and therefore cannot overflow;
+    # overlong *variable* fields are FIELD_TOO_LONG in both carriers.
+    es = parse("10" + "A" * 21)
+    dl = parse(f"{DL_BASE}/10/{'A' * 21}")
+    assert es.status_code == dl.status_code == 422
+    assert es.json()["detail"]["error"] == "FIELD_TOO_LONG"
+    assert dl.json()["detail"]["error"] == "FIELD_TOO_LONG"
+
+
+def test_two_carriers_share_fixed_field_too_long_uri_only():
+    # Overlong fixed-length fields are possible in the URI carrier only
+    # (scanner streams simply start the next element at the field boundary).
+    dl = parse(f"{DL_BASE}/3103/0025136")
+    assert dl.status_code == 422
+    assert dl.json()["detail"]["error"] == "FIELD_TOO_LONG"
