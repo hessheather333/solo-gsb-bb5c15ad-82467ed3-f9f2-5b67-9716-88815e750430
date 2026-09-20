@@ -733,3 +733,104 @@ def test_digital_link_weight_percent_encoded_bad_precision_offset():
     assert detail["error"] == "INVALID_PRECISION"
     assert detail["found"] == "A"
     assert detail["offset"] == 22
+
+
+# ------------------------------- registry refactor: family prefix & unknown AI
+
+
+def test_310_family_each_precision_digit_recognized():
+    for n in range(10):
+        resp = parse(f"310{n}000000")
+        assert resp.status_code == 200
+        element = resp.json()["elements"][0]
+        assert element["ai"] == f"310{n}"
+        assert element["unit"] == "kg"
+
+
+def test_320_family_each_precision_digit_recognized():
+    for n in range(10):
+        resp = parse(f"320{n}123456")
+        assert resp.status_code == 200
+        element = resp.json()["elements"][0]
+        assert element["ai"] == f"320{n}"
+        assert element["unit"] == "lb"
+
+
+def test_family_prefix_missing_precision_310_before_separator():
+    resp = parse(f"310{GS}17250131")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 3
+    assert detail["found"] == "<GS>"
+
+
+def test_family_prefix_missing_precision_320_at_end():
+    resp = parse("320")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 3
+    assert detail["found"] == "end of input"
+
+
+def test_family_non_digit_precision_in_query():
+    resp = parse(f"{DL_BASE}?320x=002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["found"] == "x"
+
+
+def test_family_missing_precision_in_query_310():
+    resp = parse(f"{DL_BASE}?310=002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["found"] == "310"
+
+
+def test_digital_link_well_formed_four_digit_unknown_ai():
+    # A complete, non-family 4-digit key is not a precision error.
+    resp = parse(f"{DL_BASE}/3199/000000")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNSUPPORTED_AI"
+    assert detail["found"] == "3199"
+
+
+def test_digital_link_family_key_with_extra_digit_is_unsupported():
+    # "31030" has a valid prefix+parameter but the complete key does not exist.
+    resp = parse(f"{DL_BASE}/31030/002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNSUPPORTED_AI"
+    assert detail["found"] == "31030"
+
+
+def test_unknown_ai_00_element_string():
+    resp = parse("00ABC")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNSUPPORTED_AI"
+    assert detail["found"] == "00"
+    assert detail["offset"] == 0
+
+
+def test_digital_link_unknown_ai_00():
+    resp = parse(f"{DL_BASE}/00/ABC")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNSUPPORTED_AI"
+    assert detail["found"] == "00"
+
+
+def test_longest_match_family_wins_when_followed_immediately_by_value():
+    # The fourth character "3" belongs to the AI even when a 2-digit AI
+    # sharing its start could otherwise match.
+    resp = parse("320300251310ABC")
+    assert resp.status_code == 200
+    elements = resp.json()["elements"]
+    assert [e["ai"] for e in elements] == ["3203", "10"]
+    assert elements[0]["decimal_value"] == 2.513
+    assert elements[1]["value"] == "ABC"

@@ -896,7 +896,7 @@ uvicorn app.main:app --reload --port 8080
 ```
 app/
   main.py     # FastAPI 应用与请求/响应模型（/parse、/weight-summary、/weight-pick-plan、/recall-impact、/trace-audit、/batch-genealogy）
-  gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心
+  gs1.py      # GS1 元素串 / Digital Link URI 解析与校验核心：不可变声明式 AI 注册表（精确 AI + 带精度位参数的 310n/320n 族）、两载体共享的最长匹配识别器与值校验分派
   summary.py  # 多扫描重量汇总：Decimal 重建、单位换算、GTIN+批号分组
   pickplan.py # FEFO 拣货计划：GTIN+批号+效期汇总、as_of+min_remaining_days 效期门槛、按实际效期分配需求；whole 整包模式按单条扫描做最小超量子集选择
   recall.py   # 召回范围盘点：GTIN+序列号实物去重与冲突检测、有序规则（GTIN+批号集合+效期闭区间）首命中归组、未命中汇总
@@ -904,6 +904,8 @@ app/
   genealogy.py # 生产批次谱系审计：GTIN+批号批次台账、一批一产/无来源/循环依赖图校验、稳定拓扑序库存扣减与超耗拒绝、批次最终余量
 tests/
   test_parse.py
+  test_ai_registry.py       # 不可变注册表：启动期声明校验、只读性与共享识别器（完整键/最长匹配）
+  test_carrier_consistency.py # 元素串与 Digital Link 双载体：同值同元素、同错同码
   test_weight_summary.py
   test_weight_pick_plan.py
   test_recall_impact.py
